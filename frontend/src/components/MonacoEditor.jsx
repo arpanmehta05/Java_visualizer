@@ -8,13 +8,31 @@ function getMonaco() {
   return monacoInstance;
 }
 
-/* ── helpers ── */
+const COLLAB_COLORS = [
+  "#60a5fa",
+  "#f472b6",
+  "#34d399",
+  "#fbbf24",
+  "#a78bfa",
+  "#fb923c",
+  "#22d3ee",
+  "#e879f9",
+];
+
+function pickColor(name) {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = (hash * 31 + name.charCodeAt(i)) | 0;
+  }
+  return COLLAB_COLORS[Math.abs(hash) % COLLAB_COLORS.length];
+}
+
 function findMainLines(model) {
   const lines = model.getLinesContent();
   const hits = [];
   const re = /public\s+static\s+void\s+main\s*\(/;
   for (let i = 0; i < lines.length; i++) {
-    if (re.test(lines[i])) hits.push(i + 1); // 1-based
+    if (re.test(lines[i])) hits.push(i + 1);
   }
   return hits;
 }
@@ -26,6 +44,8 @@ function MonacoEditor({
   activeLine,
   readOnly,
   language = "java",
+  roomId,
+  userName,
 }) {
   const containerRef = useRef(null);
   const editorRef = useRef(null);
@@ -35,6 +55,7 @@ function MonacoEditor({
   const codeLensProviderRef = useRef(null);
   const onChangeRef = useRef(onChange);
   const onRunRef = useRef(onRun);
+  const collabRef = useRef(null);
   const { theme } = useTheme();
 
   onChangeRef.current = onChange;
@@ -83,7 +104,7 @@ function MonacoEditor({
       applyTheme(monaco);
 
       const editor = monaco.editor.create(containerRef.current, {
-        value: code,
+        value: roomId ? "" : code,
         language,
         theme: "jdi-theme",
         fontSize: 13,
@@ -120,15 +141,13 @@ function MonacoEditor({
         },
       });
 
-      /* ── keyboard shortcuts ── */
-      // Ctrl+Enter / Cmd+Enter
       editor.addAction({
         id: "jdi-run",
         label: "Run Code",
         keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter],
         run: () => onRunRef.current && onRunRef.current(),
       });
-      // F5
+
       editor.addAction({
         id: "jdi-run-f5",
         label: "Run Code (F5)",
@@ -136,7 +155,6 @@ function MonacoEditor({
         run: () => onRunRef.current && onRunRef.current(),
       });
 
-      /* ── CodeLens: "▶ Run | 🐛 Debug" above main() ── */
       codeLensProviderRef.current = monaco.languages.registerCodeLensProvider(
         "java",
         {
@@ -151,10 +169,7 @@ function MonacoEditor({
                   endLineNumber: ln,
                   endColumn: 1,
                 },
-                command: {
-                  id: "jdi-codelens-run",
-                  title: "▶ Run",
-                },
+                command: { id: "jdi-codelens-run", title: "\u25B6 Run" },
               });
               lenses.push({
                 range: {
@@ -165,7 +180,7 @@ function MonacoEditor({
                 },
                 command: {
                   id: "jdi-codelens-debug",
-                  title: "🔍 Debug",
+                  title: "\uD83D\uDD0D Debug",
                 },
               });
             }
@@ -174,7 +189,6 @@ function MonacoEditor({
         },
       );
 
-      /* register codelens commands (only once, idempotent) */
       try {
         editor.addCommand(
           0,
@@ -183,7 +197,6 @@ function MonacoEditor({
         );
       } catch (_) {}
 
-      /* ── click gutter → toggle breakpoint ── */
       editor.onMouseDown((e) => {
         if (
           e.target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN ||
@@ -201,19 +214,80 @@ function MonacoEditor({
         }
       });
 
-      editor.onDidChangeModelContent(() => {
+      if (!roomId) {
+        editor.onDidChangeModelContent(() => {
+          if (onChangeRef.current) {
+            onChangeRef.current(editor.getValue());
+          }
+        });
+      }
+
+      editorRef.current = editor;
+
+      if (roomId) {
+        await setupCollab(editor, roomId, userName);
+      }
+    }
+
+    async function setupCollab(editor, room, name) {
+      const Y = await import("yjs");
+      const { WebsocketProvider } = await import("y-websocket");
+      const { MonacoBinding } = await import("y-monaco");
+
+      if (disposed) return;
+
+      const ydoc = new Y.Doc();
+      const wsUrl =
+        (window.location.protocol === "https:" ? "wss://" : "ws://") +
+        window.location.host +
+        "/collab";
+      const provider = new WebsocketProvider(wsUrl, room, ydoc, {
+        connect: true,
+      });
+
+      const ytext = ydoc.getText("monaco");
+
+      const displayName = name || "User-" + ydoc.clientID.toString(36);
+      const color = pickColor(displayName);
+
+      provider.awareness.setLocalStateField("user", {
+        name: displayName,
+        color,
+      });
+
+      const binding = new MonacoBinding(
+        ytext,
+        editor.getModel(),
+        new Set([editor]),
+        provider.awareness,
+      );
+
+      ytext.observe(() => {
         if (onChangeRef.current) {
           onChangeRef.current(editor.getValue());
         }
       });
 
-      editorRef.current = editor;
+      if (code && ytext.length === 0) {
+        ydoc.transact(() => {
+          ytext.insert(0, code);
+        });
+      }
+
+      collabRef.current = { ydoc, provider, binding };
     }
 
     init();
 
     return () => {
       disposed = true;
+      if (collabRef.current) {
+        collabRef.current.binding.destroy();
+        collabRef.current.provider.disconnect();
+        collabRef.current.provider.destroy();
+        collabRef.current.ydoc.destroy();
+        collabRef.current = null;
+      }
       if (codeLensProviderRef.current) {
         codeLensProviderRef.current.dispose();
         codeLensProviderRef.current = null;
@@ -223,10 +297,10 @@ function MonacoEditor({
         editorRef.current = null;
       }
     };
-  }, []);
+  }, [roomId]);
 
   useEffect(() => {
-    if (!editorRef.current) return;
+    if (!editorRef.current || roomId) return;
     const editor = editorRef.current;
     const current = editor.getValue();
     if (current !== code) {
@@ -234,7 +308,7 @@ function MonacoEditor({
       editor.setValue(code || "");
       if (pos) editor.setPosition(pos);
     }
-  }, [code]);
+  }, [code, roomId]);
 
   useEffect(() => {
     if (!editorRef.current) return;

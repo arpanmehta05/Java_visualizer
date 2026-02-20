@@ -3,9 +3,14 @@ package visualizer;
 import javax.tools.JavaCompiler;
 import javax.tools.ToolProvider;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.PrintStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Collectors;
 
 public class Main {
 
@@ -19,7 +24,21 @@ public class Main {
         Path path = Paths.get(sourcePath);
         String fileName = path.getFileName().toString();
         String className = fileName.replace(".java", "");
-        String classDir = path.getParent() != null ? path.getParent().toString() : ".";
+
+        Path sandboxRoot = path.getParent();
+        if (sandboxRoot == null) sandboxRoot = Paths.get(".");
+
+        List<String> javaFiles = new ArrayList<>();
+        try {
+            javaFiles = Files.walk(sandboxRoot)
+                    .filter(p -> p.toString().endsWith(".java"))
+                    .map(Path::toString)
+                    .collect(Collectors.toList());
+        } catch (Exception e) {
+            javaFiles.add(sourcePath);
+        }
+
+        String classDir = sandboxRoot.toString();
 
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         if (compiler == null) {
@@ -27,8 +46,19 @@ public class Main {
             System.exit(1);
         }
 
+        List<String> compilerArgs = new ArrayList<>();
+        compilerArgs.add("-g");
+        compilerArgs.add("-d");
+        compilerArgs.add(classDir);
+        compilerArgs.add("-sourcepath");
+        compilerArgs.add(classDir);
+        compilerArgs.addAll(javaFiles);
+
         ByteArrayOutputStream errStream = new ByteArrayOutputStream();
-        int result = compiler.run(null, null, new PrintStream(errStream), "-g", "-d", classDir, sourcePath);
+        int result = compiler.run(
+                null, null, new PrintStream(errStream),
+                compilerArgs.toArray(new String[0])
+        );
 
         if (result != 0) {
             String error = escapeJson(errStream.toString());
@@ -36,7 +66,7 @@ public class Main {
             System.exit(1);
         }
 
-        emit("{\"type\":\"start\",\"className\":\"" + className + "\"}");
+        emit("{\"type\":\"start\",\"className\":\"" + className + "\",\"files\":" + javaFiles.size() + "}");
 
         try {
             JDIDebugger debugger = new JDIDebugger(className, classDir);

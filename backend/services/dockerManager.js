@@ -10,6 +10,38 @@ class DockerManager {
     this.TIMEOUT_MS = 15000;
   }
 
+  materializeTree(nodes, baseDir) {
+    const javaFiles = [];
+    for (const node of nodes) {
+      const fullPath = path.join(baseDir, node.name);
+      if (node.kind === "folder") {
+        fs.mkdirSync(fullPath, { recursive: true });
+        if (node.children && node.children.length) {
+          javaFiles.push(...this.materializeTree(node.children, fullPath));
+        }
+      } else {
+        fs.writeFileSync(fullPath, node.content || "", "utf8");
+        if (node.name.endsWith(".java")) {
+          javaFiles.push(fullPath);
+        }
+      }
+    }
+    return javaFiles;
+  }
+
+  async executeProject(tree, mainClassPath, onData) {
+    const runId =
+      Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const tempDir = path.join(os.tmpdir(), `jv-${runId}`);
+    fs.mkdirSync(tempDir, { recursive: true });
+
+    this.materializeTree(tree, tempDir);
+
+    const sandboxMain = `/sandbox/${mainClassPath}`;
+
+    return this._runContainer(tempDir, [sandboxMain], onData);
+  }
+
   async execute(code, onData) {
     const runId =
       Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -20,13 +52,17 @@ class DockerManager {
     const fileName = `${className}.java`;
     fs.writeFileSync(path.join(tempDir, fileName), code, "utf8");
 
+    return this._runContainer(tempDir, [`/sandbox/${fileName}`], onData);
+  }
+
+  async _runContainer(tempDir, cmd, onData) {
     let container;
     let timeout;
 
     try {
       container = await this.docker.createContainer({
         Image: this.IMAGE_NAME,
-        Cmd: [`/sandbox/${fileName}`],
+        Cmd: cmd,
         Tty: false,
         AttachStdin: false,
         OpenStdin: false,
@@ -35,7 +71,7 @@ class DockerManager {
           Memory: 256 * 1024 * 1024,
           MemorySwap: 256 * 1024 * 1024,
           CpuPeriod: 100000,
-          CpuQuota: 80000, // 80% CPU (was 50%)
+          CpuQuota: 80000,
           NetworkMode: "none",
           PidsLimit: 64,
           SecurityOpt: ["no-new-privileges"],
@@ -56,7 +92,6 @@ class DockerManager {
         });
       }, this.TIMEOUT_MS);
 
-      // Attach to running container for real-time streaming (faster than logs)
       const stream = await container.attach({
         stream: true,
         stdout: true,
@@ -65,8 +100,6 @@ class DockerManager {
 
       await new Promise((resolve, reject) => {
         let buffer = "";
-
-        // Demux stdout/stderr from the raw Docker stream
         const passThrough = new (require("stream").PassThrough)();
         container.modem.demuxStream(stream, passThrough, passThrough);
 
